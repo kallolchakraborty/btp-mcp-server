@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 import json
-from src.btp_mcp_server.btp_cli import BTPCLI, BTPError, BTPCommandError, BTPLoginError
+from btp_mcp_server.btp_cli import BTPCLI, BTPError, BTPCommandError, BTPLoginError
 
 class TestBTPCLI(unittest.TestCase):
 
