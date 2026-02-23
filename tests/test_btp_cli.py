@@ -71,5 +71,26 @@ class TestBTPCLI(unittest.TestCase):
         self.assertIn("Admin", cmd_list)
         self.assertIn("user@test.com", cmd_list)
 
+    @patch("subprocess.run")
+    def test_list_regions(self, mock_run):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '[]'
+        mock_run.return_value = mock_result
+        self.btp.list_regions()
+        args, _ = mock_run.call_args
+        self.assertIn("accounts/region", args[0])
+
+    @patch("subprocess.run")
+    def test_list_environment_instances(self, mock_run):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = '[]'
+        mock_run.return_value = mock_result
+        self.btp.list_environment_instances("sub1")
+        args, _ = mock_run.call_args
+        self.assertIn("accounts/environment-instance", args[0])
+        self.assertIn("sub1", args[0])
+
 if __name__ == "__main__":
     unittest.main()

@@ -100,10 +100,15 @@ Add the following to your MCP client config (e.g., `claude_desktop_config.json`)
 | **Accounts** | `btp_list_subaccounts` | List all accessible subaccounts. |
 | | `btp_create_subaccount` | Provision a new subaccount with validation. |
 | | `btp_delete_subaccount` | Permanent deletion of a subaccount. |
+| | `btp_list_regions` | List available technical regions (us10, eu10, etc). |
+| | `btp_list_directories` | List directories in the global account. |
 | **Security** | `btp_list_users` | List global account users. |
 | | `btp_assign_role_collection` | Grant roles (e.g., Admin) to a user. |
 | **Resources** | `btp_list_entitlements` | Check available service plans/quotas. |
+| | `btp_remove_entitlement` | Remove an assigned entitlement from a subaccount. |
 | | `btp_list_service_instances` | List active services in a subaccount. |
+| | `btp_list_environment_instances` | List environments like Cloud Foundry or Kyma. |
+| | `btp_list_subscriptions` | List SaaS application subscriptions. |
 
 ---
 
@@ -126,6 +131,28 @@ If you see this, your BTP CLI session has expired.
 
 **CLI Not Found (⚠️ BTP CLI not found)**
 Ensure `btp` is in your PATH. On macOS/Linux, try `ln -s /path/to/btp /usr/local/bin/btp`.
+
+---
+
+## 🏗️ System Design
+
+The server follows a layered architecture to ensure separation of concerns and maximum stability:
+
+*   **Tool Layer (`server.py`)**: Uses `FastMCP` to register Python functions as MCP tools. Implements strict Pydantic validation and maps technical exceptions to human-readable markdown tips.
+*   **Service Layer (`btp_cli.py`)**: Orchestrates command execution. Manages the state of the CLI path, handles binary auto-discovery, and implements the "Deep JSON Recovery" algorithm.
+*   **Execution Layer (`subprocess`)**: Interacts directly with the OS. Uses hardened environments (`CI=true`) and standard error redirection to maintain security and non-interactivity.
+*   **Utility Layer (`utils.py`)**: Centralizes cross-cutting concerns like logging to `stderr` and custom domain-specific exceptions.
+
+## 🔄 Control Flow
+
+1.  **Request Intake**: The AI client (e.g., Antigravity) sends a JSON-RPC request to a registered tool (e.g., `btp_list_subaccounts`).
+2.  **Pre-Validation**: The Tool Layer hydrates parameters and performs regex-based technical validation (IDs/GUIDs).
+3.  **Execution**: The Service Layer constructs a safe CLI command, injecting `--format json` as a global prefix.
+4.  **Retry & Recovery**: 
+    - If the command times out, it retries with exponential backoff.
+    - If the output contains warnings + JSON, the "Deep Recovery" engine extracts the valid payload.
+5.  **Error Mapping**: If the CLI returns "Session Expired", the decorator catches it and provides the user with an exact `btp login` command for their specific binary path.
+6.  **Structured Response**: The final JSON payload is beautified and returned to the AI as a markdown-formatted string.
 
 ---
 

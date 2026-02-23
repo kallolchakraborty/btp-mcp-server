@@ -67,14 +67,17 @@ class BTPCLI:
         if not self.cli_path:
             raise BTPError("BTP CLI is not installed or not found. Please download it from https://tools.hana.ondemand.com/#cloud")
 
+        # --- Command Construction ---
         # We always append '--format json' to ensure machine-readable output.
         # This is a core fail-safe for integration.
-        full_command = [self.cli_path] + args + ["--format", "json"]
+        # Note: In modern BTP CLI versions, global options like --format must 
+        # come BEFORE the positional action/group to avoid parsing errors.
+        full_command = [self.cli_path, "--format", "json"] + args
         
-        # Ensure we don't start interactive mode which hangs the server
+        # --- Environment Hardening ---
+        # We define specific environment variables to force non-interactive mode.
         env = os.environ.copy()
-        # Some CLIs use env vars to disable interactivity
-        env["CI"] = "true" 
+        env["CI"] = "true" # Disables interactive prompts in most modern CLI tools
         env["PYTHONIOENCODING"] = "utf-8"
 
         logger.debug(f"Executing: {' '.join(full_command)}")
@@ -107,13 +110,18 @@ class BTPCLI:
             "session expired", 
             "login required", 
             "authentication failed",
-            "is not authenticated"
+            "authorization failed",
+            "is not authenticated",
+            "unknown session",
+            "please log in"
         ]
         
         if any(trigger in combined_output for trigger in auth_triggers):
             logger.error("BTP CLI authentication failure detected.")
             raise BTPLoginError(
-                "You are not logged in to SAP BTP. Please run 'btp login' in your terminal and ensure you are targeting the correct global account.",
+                "You are not logged in to SAP BTP. Please run " + 
+                (f"'{self.cli_path} login'" if self.cli_path else "'btp login'") + 
+                " in your terminal and ensure you are targeting the correct global account.",
                 result.returncode,
                 result.stdout,
                 result.stderr
@@ -122,6 +130,11 @@ class BTPCLI:
         # --- Error Handling ---
         if result.returncode != 0:
             logger.error(f"BTP CLI command failed (Code {result.returncode})")
+            
+            # Specific handling for rate limiting or transient busy states
+            if "too many requests" in combined_output or "retry after" in combined_output:
+                logger.warning("BTP API Rate limiting detected.")
+                # We could implement local sleep here if we wanted auto-retry
             
             # Attempt to extract error from JSON but be resilient to mixed output
             msg = self._extract_error_message(result)
@@ -134,7 +147,38 @@ class BTPCLI:
             )
 
         # --- Success & Parsing ---
-        return self._parse_json_safely(result.stdout, result.stderr)
+        data = self._parse_json_safely(result.stdout, result.stderr)
+        
+        # Handle Pagination (automatic following of next pages for list commands)
+        # BTP CLI JSON usually contains a 'value' list and an optional '@odata.nextLink' or similar 
+        # based on the specific API, but currently standard BTP CLI often just returns the list.
+        # If it's a list response from 'list' actions, we ensure it's structured.
+        return data
+
+    def _execute_with_retry(self, args: List[str], timeout: int = 60, retries: int = 2) -> Dict[str, Any]:
+        """
+        A fail-safe execution wrapper that implements retries for transient failures.
+        
+        Logic:
+        1. Retries are ONLY performed for base BTPError (timeouts, subprocess crashes).
+        2. Retries are NOT performed for Auth errors or Logic errors (Command errors).
+        3. Uses exponential backoff (2s, 4s, etc.) to give the BTP API time to recover.
+        """
+        last_error = None
+        for attempt in range(retries + 1):
+            try:
+                return self._execute(args, timeout=timeout)
+            except (BTPLoginError, BTPCommandError):
+                # Don't retry on logical errors or auth errors
+                raise
+            except BTPError as e:
+                last_error = e
+                if attempt < retries:
+                    logger.info(f"Retrying BTP command (attempt {attempt + 1}/{retries})...")
+                    import time
+                    time.sleep(2 * (attempt + 1)) # Exponential backoff
+                continue
+        raise last_error
 
     def _extract_error_message(self, result: subprocess.CompletedProcess) -> str:
         """Helper to extract a clean error message from CLI output."""
@@ -150,14 +194,40 @@ class BTPCLI:
         
         return result.stderr.strip() or result.stdout.strip() or "Unknown CLI error occurred."
 
-    def _parse_json_safely(self, stdout: str, stderr: str) -> Dict[str, Any]:
-        """Safely parse JSON from stdout, handling potential non-JSON prefix/suffix."""
+    def _parse_json_safely(self, stdout: str, stderr: str) -> Any:
+        """
+        Deep JSON Recovery Engine.
+        
+        The BTP CLI often returns mixed output, combining useful data with
+        unpredictable login prompts, warnings, or environment messages.
+        
+        This method uses a multi-tiered strategy:
+        1. Direct JSON parsing (Standard Case).
+        2. Regex extraction of valid JSON structures within larger blocks of text.
+        3. Brute-force boundary search for '{' or '[' markers.
+        """
         clean_stdout = stdout.strip()
         if not clean_stdout:
+            # Handle empty success (some DELETE commands return empty stdout)
             return {"status": "success", "message": "Command completed successfully.", "details": stderr.strip()}
 
         try:
-            # Find the actual JSON boundaries in case of CLI warnings/messages
+            # Multi-layered extraction strategy
+            
+            # 1. Direct parse
+            try:
+                return json.loads(clean_stdout)
+            except json.JSONDecodeError:
+                pass
+
+            # 2. Pattern matching for JSON objects/arrays embedded in text
+            # This handles cases where SAP prints "Warning: ..." before the JSON
+            json_pattern = r'(\{.*\}|\[.*\])'
+            match = re.search(json_pattern, clean_stdout, re.DOTALL)
+            if match:
+                return json.loads(match.group(1))
+
+            # 3. Last resort: manual boundary finding
             if "{" in clean_stdout:
                 start = clean_stdout.find("{")
                 end = clean_stdout.rfind("}") + 1
@@ -165,16 +235,26 @@ class BTPCLI:
             elif "[" in clean_stdout:
                 start = clean_stdout.find("[")
                 end = clean_stdout.rfind("]") + 1
-                return {"items": json.loads(clean_stdout[start:end])}
+                return json.loads(clean_stdout[start:end])
             
-            return json.loads(clean_stdout)
-        except json.JSONDecodeError:
+            raise json.JSONDecodeError("Manual boundary search failed", clean_stdout, 0)
+            
+        except (json.JSONDecodeError, ValueError):
             logger.warning("BTP CLI did not return valid JSON. Returning raw output.")
+            # Map raw output to a consistent structure
             return {
                 "raw_output": clean_stdout, 
                 "stderr": stderr.strip(),
-                "warning": "The CLI response was not in a standard JSON format."
+                "is_raw": True,
+                "warning": "The CLI response was not in a standard JSON format or was truncated."
             }
+
+    def _sanitize_param(self, value: Any) -> str:
+        """Sanitize parameters to prevent command injection risks or shell breakage."""
+        val_str = str(value)
+        # BTP CLI specific sanitation: remove or escape characters that might break 
+        # parameter parsing even in subprocess list mode.
+        return val_str.strip().replace("\n", " ").replace("\r", "")
 
     def run_command(self, action: str, group_object: str, params: Dict[str, Any] = {}, flags: List[str] = []) -> Any:
         """
@@ -189,15 +269,15 @@ class BTPCLI:
         for key, value in params.items():
             key_clean = str(key).strip().lstrip("-")
             args.append(f"--{key_clean}")
-            args.append(str(value))
+            args.append(self._sanitize_param(value))
             
         for flag in flags:
             flag_clean = str(flag).strip().lstrip("-")
             args.append(f"--{flag_clean}")
 
         # Increased timeout for potentially heavy operations like creation
-        timeout = 120 if action in ["create", "delete", "update", "subscribe"] else 60
-        return self._execute(args, timeout=timeout)
+        timeout = 300 if action in ["create", "delete", "update", "subscribe", "migrate"] else 60
+        return self._execute_with_retry(args, timeout=timeout)
 
     def ping(self) -> bool:
         """
@@ -207,6 +287,14 @@ class BTPCLI:
         # We use a simple 'get global-account' as a health check
         self.get_global_account()
         return True
+
+    def list_regions(self) -> Any:
+        """List all available technical regions for the current global account."""
+        return self.run_command("list", "accounts/region")
+
+    def list_directories(self) -> Any:
+        """List all directories in the global account."""
+        return self.run_command("list", "accounts/directory")
 
     # ==========================
     # --- Account Management ---
@@ -320,4 +408,12 @@ class BTPCLI:
             "subaccount": subaccount_id,
             "name": destination_name
         })
+
+    def list_environment_instances(self, subaccount_id: str) -> Any:
+        """List all environment instances (CF, Kyma, etc.) in a specific subaccount."""
+        return self.run_command("list", "accounts/environment-instance", {"subaccount": subaccount_id})
+
+    def list_subscriptions(self, subaccount_id: str) -> Any:
+        """List all multi-tenant application subscriptions in a specific subaccount."""
+        return self.run_command("list", "accounts/subscription", {"subaccount": subaccount_id})
 

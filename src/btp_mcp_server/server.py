@@ -11,13 +11,26 @@ from .utils import logger
 mcp = FastMCP("SAP BTP CLI Manager")
 
 
-# Initialize the BTP CLI wrapper
-cli = BTPCLI()
+# --- Initial Setup ---
+# Initialize the BTP CLI wrapper with optional path from environment.
+# This allows the server to work even if 'btp' is not in the system's global PATH.
+import os
+cli_path = os.environ.get("BTP_CLI_PATH")
+cli = BTPCLI(cli_path=cli_path)
 
+# --- Response Formatting ---
 def format_response(data: Any) -> str:
     """
-    Standardizes the output format for all tools. 
-    Ensures the LLM receives clean, structured, and parseable information.
+    Standardizes and beautifies the output format for all tools. 
+    Ensures the AI agent receives structured, readable, and parseable markdown-like strings.
+    
+    Processing Steps:
+    1. Handle None: Returns a clear success message.
+    2. Handle Lists/Dicts: 
+       - If the result is a wrapper dict with an 'items' key (common in BTP CLI),
+         it unwraps it to provide a cleaner list to the LLM.
+       - Converts to pretty-printed JSON (indent=2) for max readability.
+    3. Handle Strings/Primitives: Returns stripped string.
     """
     if data is None:
         return "Command completed successfully with no return data."
@@ -31,7 +44,18 @@ def format_response(data: Any) -> str:
     return str(data).strip()
 
 def handle_btp_errors(func):
-    """Decorator to provide consistent error handling across all MCP tools."""
+    """
+    A unified higher-order decorator that wraps all tool execution.
+    It translates internal Python exceptions into human-friendly (and AI-friendly) 
+    response strings.
+    
+    Error Mapping:
+    - BTPLoginError: Prompts the user with specific CLI login commands.
+    - BTPCommandError: Captures CLI-level failures (invalid IDs, permissions) and 
+      appends helpful 'TIP' hints based on natural language analysis of the error.
+    - BTPError: Catches foundational execution errors (timeouts, missing binaries).
+    - Exception: Catch-all for unexpected internal logic bugs to prevent server crash.
+    """
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
@@ -40,14 +64,23 @@ def handle_btp_errors(func):
                 f"❌ AUTHENTICATION ERROR: {str(e)}\n\n"
                 "To fix this, please follow these steps:\n"
                 "1. Open your local terminal.\n"
-                "2. Run: btp login\n"
+                f"2. Run: {cli.cli_path or 'btp'} login\n"
                 "3. Follow the prompts to authenticate.\n"
                 "4. Once authenticated, try your request again."
             )
         except BTPCommandError as e:
-            return f"⚠️ BTP CLI ERROR: {str(e)}\n(Return Code: {e.return_code})"
+            error_msg = str(e)
+            hint = ""
+            if "entitlement" in error_msg.lower() and "quota" in error_msg.lower():
+                hint = "\n💡 TIP: Check if your global account has enough quota for this service plan using 'btp_list_entitlements'."
+            elif "region" in error_msg.lower():
+                hint = "\n💡 TIP: Run 'btp_list_regions' to see available technical region IDs."
+            elif "already exists" in error_msg.lower():
+                hint = "\n💡 TIP: Subdomains must be globally unique across all of BTP, not just your account."
+                
+            return f"⚠️ BTP CLI ERROR: {error_msg}{hint}\n(Return Code: {e.return_code})"
         except BTPError as e:
-            return f"🚫 BTP SERVER ERROR: {str(e)}"
+            return f"🚫 BTP SERVER ERROR: {str(e)}\nEnsure your internet connection is stable and the SAP BTP API is online."
         except Exception as e:
             logger.exception(f"Unexpected error in tool {func.__name__}")
             return f"❌ INTERNAL ERROR: An unexpected error occurred: {str(e)}"
@@ -122,8 +155,11 @@ def btp_create_subaccount(
     if not display_name or len(display_name.strip()) == 0:
         return "❌ Error: display_name cannot be empty."
     
-    if not re.match(r'^[a-z][a-z0-9-]*$', subdomain):
-        return "❌ Error: subdomain must be lowercase, start with a letter, and contain only letters, numbers, and hyphens."
+    if not re.match(r'^[a-z0-9-]+$', region):
+        return "❌ Error: region must be a technical ID (e.g., 'us10', 'cf-eu10')."
+
+    if not re.match(r'^[a-z][a-z0-9-]{0,62}$', subdomain):
+        return "❌ Error: subdomain must start with a letter, be lowercase, contain only letters/numbers/hyphens, and be max 63 chars."
 
     return format_response(cli.create_subaccount(display_name, region, subdomain))
 
@@ -144,6 +180,18 @@ def btp_delete_subaccount(
 def btp_get_global_account() -> str:
     """Retrieve metadata about the current global account context, including its name and ID."""
     return format_response(cli.get_global_account())
+
+@mcp.tool()
+@handle_btp_errors
+def btp_list_regions() -> str:
+    """List all technical regions available in the global account (e.g., 'us10', 'eu10')."""
+    return format_response(cli.list_regions())
+
+@mcp.tool()
+@handle_btp_errors
+def btp_list_directories() -> str:
+    """List all directories created within the global account hierarchy."""
+    return format_response(cli.list_directories())
 
 # ======================
 # --- Security Tools ---
@@ -218,6 +266,19 @@ def btp_assign_entitlement(
     """
     return format_response(cli.assign_entitlement(subaccount_id, service_name, service_plan, amount))
 
+@mcp.tool()
+@handle_btp_errors
+def btp_remove_entitlement(
+    subaccount_id: str = Field(..., description="The ID of the subaccount."),
+    service_name: str = Field(..., description="Technical name of the service."),
+    service_plan: str = Field(..., description="Name of the plan.")
+) -> str:
+    """
+    Remove an entitlement (service plan quota) from a subaccount.
+    Useful for freeing up global quota or cleaning up unused services.
+    """
+    return format_response(cli.remove_entitlement(subaccount_id, service_name, service_plan))
+
 # =====================
 # --- Service Tools ---
 # =====================
@@ -237,6 +298,22 @@ def btp_list_service_bindings(
 ) -> str:
     """List service bindings (credentials for applications) in a subaccount."""
     return format_response(cli.list_service_bindings(subaccount_id))
+
+@mcp.tool()
+@handle_btp_errors
+def btp_list_environment_instances(
+    subaccount_id: str = Field(..., description="The ID of the subaccount.")
+) -> str:
+    """List all environment instances (e.g., Cloud Foundry, Kyma) in a subaccount."""
+    return format_response(cli.list_environment_instances(subaccount_id))
+
+@mcp.tool()
+@handle_btp_errors
+def btp_list_subscriptions(
+    subaccount_id: str = Field(..., description="The ID of the subaccount.")
+) -> str:
+    """List multi-tenant application subscriptions in a subaccount."""
+    return format_response(cli.list_subscriptions(subaccount_id))
 
 # ==========================
 # --- Connectivity Tools ---
